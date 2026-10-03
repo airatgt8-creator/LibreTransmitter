@@ -99,6 +99,7 @@ public enum SensorType: String, CustomStringConvertible {
     case libre2       = "Libre 2"
     case libre2US     = "Libre 2 US"
     case libre2CA     = "Libre 2 CA"
+    case libre2RUGen2 = "Libre 2 RU Gen2"
     case libreSense   = "Libre Sense"
     case libre3       = "Libre 3"
     case dexcomOne    = "Dexcom ONE"
@@ -116,6 +117,15 @@ public enum SensorType: String, CustomStringConvertible {
         case 0xE5, 0xE6: self = .libreUS14day
         case 0x70: self = .libreProH
         case 0xC5, 0x9D, 0xC6, 0x7F: self = .libre2
+        case 0x2B:
+            guard patchInfo.count > 3 else {
+                self = .unknown
+                return
+            }
+            let isLibre2RUGen2 = patchInfo[1] == 0x0A
+                && patchInfo[2] == 0x39
+                && patchInfo[3] == 0x08
+            self = isLibre2RUGen2 ? .libre2RUGen2 : .unknown
         case 0x76:
             guard patchInfo.count > 3 else {
                 self = .unknown
@@ -149,6 +159,10 @@ public enum SensorType: String, CustomStringConvertible {
                 return "Libre 2 family 7F (incomplete patchInfo)"
             }
             return patchInfo[2] & 0x0F == 0 ? "Libre 2 EU 7F" : "Libre 2 Plus EU 7F"
+        case 0x2B:
+            return SensorType(patchInfo: patchInfo) == .libre2RUGen2
+                ? "Libre 2 RU Gen2 (2B 0A 39 08)"
+                : "Libre 2 Gen2 family 2B (unsupported regional variant)"
         default:
             return "\(SensorType(patchInfo: patchInfo).description) (0x\(String(format: "%02X", sensorType)))"
         }
