@@ -85,7 +85,7 @@ class Libre2DirectTransmitter: LibreTransmitterProxyProtocol {
     func updateValueForNotifyCharacteristics(_ value: Data, peripheral: CBPeripheral, writeCharacteristic: CBCharacteristic?) {
         rxBuffer.append(value)
 
-        logger.debug("[LibreRU][BLE] stage=notification fragmentBytes=\(value.count) accumulatedBytes=\(self.rxBuffer.count) expectedBytes=\(expectedBufferSize)")
+        logger.debug("[LibreRU][BLE] stage=notification fragmentBytes=\(value.count) accumulatedBytes=\(self.rxBuffer.count) expectedBytes=\(self.expectedBufferSize)")
         
         delegate?.libreDeviceLogMessage(payload: "libre2direct received value: \(value.toDebugString())", type: .receive)
 
@@ -93,7 +93,7 @@ class Libre2DirectTransmitter: LibreTransmitterProxyProtocol {
             delegate?.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=frame-assembled bytes=\(rxBuffer.count)", type: .receive)
             handleCompleteMessage()
         } else if rxBuffer.count > expectedBufferSize {
-            logger.error("[LibreRU][BLE] stage=frame-assembled result=oversized bytes=\(self.rxBuffer.count) expectedBytes=\(expectedBufferSize)")
+            logger.error("[LibreRU][BLE] stage=frame-assembled result=oversized bytes=\(self.rxBuffer.count) expectedBytes=\(self.expectedBufferSize)")
             delegate?.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=frame-assembled result=oversized bytes=\(rxBuffer.count) expectedBytes=\(expectedBufferSize)", type: .error)
             reset()
         }
@@ -158,7 +158,7 @@ class Libre2DirectTransmitter: LibreTransmitterProxyProtocol {
     private var lastSensorUUID : [UInt8]?
     func handleCompleteMessage() {
         guard rxBuffer.count >= expectedBufferSize else {
-            logger.error("[LibreRU][BLE] stage=frame-validation result=short bytes=\(self.rxBuffer.count) expectedBytes=\(expectedBufferSize)")
+            logger.error("[LibreRU][BLE] stage=frame-validation result=short bytes=\(self.rxBuffer.count) expectedBytes=\(self.expectedBufferSize)")
             reset()
             return
         }
