@@ -17,6 +17,8 @@ public enum PairingError: Error {
     case decryptionError
     case noPatchInfo
     case nfcNotSupported
+    case gen2ChallengeFailed
+    case gen2ChallengeCaptured
 }
 
 extension PairingError: LocalizedError {
@@ -34,6 +36,10 @@ extension PairingError: LocalizedError {
             return LocalizedString("Could not get patch info", comment: "error description for PairingError.noPatchInfo")
         case .nfcNotSupported:
             return LocalizedString("Phone NFC not supported!", comment: "error description for PairingError.nfcNotSupported")
+        case .gen2ChallengeFailed:
+            return LocalizedString("Libre 2 Gen2 diagnostic challenge failed", comment: "error description for PairingError.gen2ChallengeFailed")
+        case .gen2ChallengeCaptured:
+            return LocalizedString("Libre 2 Gen2 diagnostic challenge captured; authenticated reading is not enabled", comment: "error description for PairingError.gen2ChallengeCaptured")
         }
     }
 
@@ -172,6 +178,11 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
                             return
                         }
 
+                        if patchInfo == Data([0x2B, 0x0A, 0x39, 0x08, 0x4B, 0xF7]) {
+                            self.probeLibre2Gen2Challenge(tag: tag, session: session, patchInfo: patchInfo)
+                            return
+                        }
+
                         // Core NFC operations must be serialized. The previous implementation
                         // launched all 15 reads at once and assembled FRAM when the final request
                         // happened to return, which could produce an incomplete frame.
@@ -196,6 +207,42 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
                     }
                 }
             }
+        }
+    }
+
+    private func probeLibre2Gen2Challenge(
+        tag: NFCISO15693Tag,
+        session: NFCTagReaderSession,
+        patchInfo: Data
+    ) {
+        logger.info("[LibreRU][GEN2] stage=challenge result=started command=0xA1 subcommand=0x20 patchInfo=\(patchInfo.hexEncodedString().uppercased(), privacy: .public)")
+
+        tag.customCommand(
+            requestFlags: .highDataRate,
+            customCommandCode: 0xA1,
+            customRequestParameters: Data([0x20])
+        ) { response, error in
+            let responseHex = response.hexEncodedString().uppercased()
+
+            if let error {
+                let nsError = error as NSError
+                self.logger.error("[LibreRU][GEN2] stage=challenge result=failed responseBytes=\(response.count) response=\(responseHex, privacy: .public) errorDomain=\(nsError.domain, privacy: .public) errorCode=\(nsError.code) errorUserInfo=\(String(describing: nsError.userInfo), privacy: .public)")
+                session.invalidate(errorMessage: PairingError.gen2ChallengeFailed.localizedDescription)
+                self.sendError(PairingError.gen2ChallengeFailed)
+                return
+            }
+
+            guard !response.isEmpty else {
+                let diagnosticError = PairingError.gen2ChallengeFailed as NSError
+                self.logger.error("[LibreRU][GEN2] stage=challenge result=empty-response responseBytes=0 response= errorDomain=\(diagnosticError.domain, privacy: .public) errorCode=\(diagnosticError.code) errorUserInfo=\(String(describing: diagnosticError.userInfo), privacy: .public)")
+                session.invalidate(errorMessage: PairingError.gen2ChallengeFailed.localizedDescription)
+                self.sendError(PairingError.gen2ChallengeFailed)
+                return
+            }
+
+            self.logger.info("[LibreRU][GEN2] stage=challenge result=success responseBytes=\(response.count) response=\(responseHex, privacy: .public)")
+            session.invalidate(errorMessage: PairingError.gen2ChallengeCaptured.localizedDescription)
+            self.sendError(PairingError.gen2ChallengeCaptured)
         }
     }
 
