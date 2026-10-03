@@ -154,6 +154,9 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
                         let uidHex = sensorUID.hexEncodedString().uppercased()
                         let sensorTypeDescription = SensorType.diagnosticDescription(patchInfo: patchInfo)
 
+                        self.logger.info("[LibreRU][NFC] stage=patch-info diagnostic patchInfo=\(patchHex, privacy: .public)")
+                        self.logger.info("[LibreRU][NFC] stage=sensor-type diagnostic sensorType=\(sensorTypeDescription, privacy: .public)")
+
                         let identityMessage = "[LibreRU][NFC] stage=patch-info result=success" +
                             " uid=\(uidHex) uidBytes=\(sensorUID.count)" +
                             " patchInfo=\(patchHex) patchInfoBytes=\(patchInfo.count)" +
@@ -267,7 +270,8 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
             if let error {
                 let nsError = error as NSError
                 self.logger.error("[LibreRU][NFC] stage=fram-read mode=single-block result=failed block=\(nextBlock) errorDomain=\(nsError.domain, privacy: .public) errorCode=\(nsError.code) errorUserInfo=\(String(describing: nsError.userInfo), privacy: .public)")
-                completion(.failure(error))
+                self.logger.info("[LibreRU][NFC] stage=fram-read fallback=custom-b3 address=0xF860 requestedBytes=344")
+                self.readFRAMUsingCustomB3(tag: tag, completion: completion)
                 return
             }
 
@@ -280,6 +284,33 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
                 buffer: nextBuffer,
                 completion: completion
             )
+        }
+    }
+
+    private func readFRAMUsingCustomB3(
+        tag: NFCISO15693Tag,
+        completion: @escaping (Result<Data, Error>) -> Void
+    ) {
+        readRaw(0xF860, 344, tag: tag, logCustomB3Chunks: true) { address, data, error in
+            let addressDescription = String(format: "0x%04X", address)
+
+            if let error {
+                let nsError = error as NSError
+                self.logger.error("[LibreRU][NFC] stage=fram-read mode=custom-b3 result=failed address=\(addressDescription, privacy: .public) finalBytes=\(data.count) errorDomain=\(nsError.domain, privacy: .public) errorCode=\(nsError.code) errorUserInfo=\(String(describing: nsError.userInfo), privacy: .public)")
+                completion(.failure(error))
+                return
+            }
+
+            self.logger.info("[LibreRU][NFC] stage=fram-read mode=custom-b3 result=complete address=\(addressDescription, privacy: .public) finalBytes=\(data.count)")
+            guard data.count == 344 else {
+                let invalidSizeError = PairingStageError.unexpectedByteCount(expected: 344, actual: data.count)
+                let nsError = invalidSizeError as NSError
+                self.logger.error("[LibreRU][NFC] stage=fram-read mode=custom-b3 result=invalid-size address=\(addressDescription, privacy: .public) finalBytes=\(data.count) errorDomain=\(nsError.domain, privacy: .public) errorCode=\(nsError.code)")
+                completion(.failure(invalidSizeError))
+                return
+            }
+
+            completion(.success(data))
         }
     }
 
@@ -357,7 +388,14 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
         }
     }
 
-    private func readRaw(_ address: UInt16, _ bytes: Int, buffer: Data = Data(), tag: NFCISO15693Tag, handler: @escaping (UInt16, Data, Error?) -> Void) {
+    private func readRaw(
+        _ address: UInt16,
+        _ bytes: Int,
+        buffer: Data = Data(),
+        tag: NFCISO15693Tag,
+        logCustomB3Chunks: Bool = false,
+        handler: @escaping (UInt16, Data, Error?) -> Void
+    ) {
         
         var buffer = buffer
         let addressToRead = address + UInt16(buffer.count)
@@ -375,11 +413,32 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
         tag.customCommand(requestFlags: .highDataRate, customCommandCode: Int(readRawCommand.code), customRequestParameters: readRawCommand.parameters) { response, error in
             var data = response
 
-            if error != nil {
+            if let error {
+                if logCustomB3Chunks {
+                    let nsError = error as NSError
+                    let addressDescription = String(format: "0x%04X", addressToRead)
+                    self.logger.error("[LibreRU][NFC] stage=fram-read mode=custom-b3 result=chunk-failed address=\(addressDescription, privacy: .public) responseBytes=\(response.count) errorDomain=\(nsError.domain, privacy: .public) errorCode=\(nsError.code) errorUserInfo=\(String(describing: nsError.userInfo), privacy: .public)")
+                    handler(address, buffer, error)
+                    return
+                }
                 remainingBytes = 0
             } else {
+                if logCustomB3Chunks && data.isEmpty {
+                    let emptyResponseError = PairingStageError.emptyRawResponse(address: addressToRead)
+                    let nsError = emptyResponseError as NSError
+                    let addressDescription = String(format: "0x%04X", addressToRead)
+                    self.logger.error("[LibreRU][NFC] stage=fram-read mode=custom-b3 result=chunk-failed address=\(addressDescription, privacy: .public) responseBytes=0 errorDomain=\(nsError.domain, privacy: .public) errorCode=\(nsError.code)")
+                    handler(address, buffer, emptyResponseError)
+                    return
+                }
+
                 if addressToRead % 2 == 1 { data = data.subdata(in: 1 ..< data.count) }
                 if data.count - Int(bytesToRead) == 1 { data = data.subdata(in: 0 ..< data.count - 1) }
+            }
+
+            if logCustomB3Chunks, error == nil {
+                let addressDescription = String(format: "0x%04X", addressToRead)
+                self.logger.info("[LibreRU][NFC] stage=fram-read mode=custom-b3 result=chunk-success address=\(addressDescription, privacy: .public) responseBytes=\(response.count) acceptedBytes=\(data.count)")
             }
 
             buffer += data
@@ -388,7 +447,9 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
             if remainingBytes == 0 {
                 handler(address, buffer, error)
             } else {
-                self.readRaw(address, remainingBytes, buffer: buffer, tag: tag) { address, data, error in handler(address, data, error) }
+                self.readRaw(address, remainingBytes, buffer: buffer, tag: tag, logCustomB3Chunks: logCustomB3Chunks) { address, data, error in
+                    handler(address, data, error)
+                }
             }
         }
     }
@@ -518,11 +579,17 @@ private struct NFCCommand {
 
 private enum PairingStageError: LocalizedError {
     case unexpectedBlockCount(expected: Int, actual: Int)
+    case unexpectedByteCount(expected: Int, actual: Int)
+    case emptyRawResponse(address: UInt16)
 
     var errorDescription: String? {
         switch self {
         case .unexpectedBlockCount(let expected, let actual):
             return "Expected \(expected) NFC blocks but received \(actual)"
+        case .unexpectedByteCount(let expected, let actual):
+            return "Expected \(expected) NFC bytes but received \(actual)"
+        case .emptyRawResponse(let address):
+            return "Received an empty NFC raw-read response at 0x\(String(format: "%04X", address))"
         }
     }
 }
