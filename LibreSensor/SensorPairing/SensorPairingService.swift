@@ -175,7 +175,8 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
                         self.readFRAMSequentially(tag: tag) { result in
                             switch result {
                             case .failure(let error):
-                                self.logger.error("[LibreRU][NFC] stage=fram-read result=failed error=\(error.localizedDescription, privacy: .public)")
+                                let nsError = error as NSError
+                                self.logger.error("[LibreRU][NFC] stage=fram-read result=failed errorDomain=\(nsError.domain, privacy: .public) errorCode=\(nsError.code) errorUserInfo=\(String(describing: nsError.userInfo), privacy: .public)")
                                 session.invalidate(errorMessage: PairingError.noSensorData.localizedDescription)
                                 self.sendError(PairingError.noSensorData)
                             case .success(let fram):
@@ -216,7 +217,14 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
             blockRange: NSRange(UInt8(nextBlock) ... UInt8(lastBlock))
         ) { blockArray, error in
             if let error {
-                completion(.failure(error))
+                let nsError = error as NSError
+                self.logger.error("[LibreRU][NFC] stage=fram-read mode=multi-block result=failed blockRange=\(nextBlock)-\(lastBlock) errorDomain=\(nsError.domain, privacy: .public) errorCode=\(nsError.code) errorUserInfo=\(String(describing: nsError.userInfo), privacy: .public)")
+                self.logger.info("[LibreRU][NFC] stage=fram-read fallback=single-block blockRange=0-\(blockCount - 1)")
+                self.readFRAMSingleBlocksSequentially(
+                    tag: tag,
+                    blockCount: blockCount,
+                    completion: completion
+                )
                 return
             }
 
@@ -233,6 +241,42 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
                 nextBlock: lastBlock + 1,
                 blockCount: blockCount,
                 requestBlockCount: requestBlockCount,
+                buffer: nextBuffer,
+                completion: completion
+            )
+        }
+    }
+
+    private func readFRAMSingleBlocksSequentially(
+        tag: NFCISO15693Tag,
+        nextBlock: Int = 0,
+        blockCount: Int = 43,
+        buffer: Data = Data(),
+        completion: @escaping (Result<Data, Error>) -> Void
+    ) {
+        guard nextBlock < blockCount else {
+            logger.info("[LibreRU][NFC] stage=fram-read mode=single-block result=success bytes=\(buffer.count)")
+            completion(.success(buffer))
+            return
+        }
+
+        tag.readSingleBlock(
+            requestFlags: .highDataRate,
+            blockNumber: UInt8(nextBlock)
+        ) { block, error in
+            if let error {
+                let nsError = error as NSError
+                self.logger.error("[LibreRU][NFC] stage=fram-read mode=single-block result=failed block=\(nextBlock) errorDomain=\(nsError.domain, privacy: .public) errorCode=\(nsError.code) errorUserInfo=\(String(describing: nsError.userInfo), privacy: .public)")
+                completion(.failure(error))
+                return
+            }
+
+            var nextBuffer = buffer
+            nextBuffer.append(block)
+            self.readFRAMSingleBlocksSequentially(
+                tag: tag,
+                nextBlock: nextBlock + 1,
+                blockCount: blockCount,
                 buffer: nextBuffer,
                 completion: completion
             )
