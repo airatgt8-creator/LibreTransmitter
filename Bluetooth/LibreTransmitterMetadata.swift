@@ -106,12 +106,22 @@ public enum SensorType: String, CustomStringConvertible {
     case unknown      = "Libre"
 
     public init(patchInfo: Data) {
-        switch patchInfo[0] {
+        guard let sensorType = patchInfo.first else {
+            self = .unknown
+            return
+        }
+
+        switch sensorType {
         case 0xDF, 0xA2: self = .libre1
         case 0xE5, 0xE6: self = .libreUS14day
         case 0x70: self = .libreProH
         case 0xC5, 0x9D, 0xC6, 0x7F: self = .libre2
-        case 0x76: self = patchInfo[3] == 0x02 ? .libre2US : patchInfo[3] == 0x04 ? .libre2CA : patchInfo[2] >> 4 == 7 ? .libreSense : .unknown
+        case 0x76:
+            guard patchInfo.count > 3 else {
+                self = .unknown
+                return
+            }
+            self = patchInfo[3] == 0x02 ? .libre2US : patchInfo[3] == 0x04 ? .libre2CA : patchInfo[2] >> 4 == 7 ? .libreSense : .unknown
         default:
             if patchInfo.count == 24 {
                 self = .libre3
@@ -122,4 +132,25 @@ public enum SensorType: String, CustomStringConvertible {
     }
 
     public var description: String { self.rawValue }
+
+    /// A diagnostic-only label that keeps regional patch variants visible in logs without
+    /// changing the crypto path selected by `SensorType`.
+    public static func diagnosticDescription(patchInfo: Data) -> String {
+        guard let sensorType = patchInfo.first else {
+            return "Unknown (empty patchInfo)"
+        }
+
+        switch sensorType {
+        case 0x9D: return "Libre 2 EU (9D)"
+        case 0xC5: return "Libre 2 EU C5"
+        case 0xC6: return "Libre 2 family C6 (regional variant; unvalidated)"
+        case 0x7F:
+            guard patchInfo.count >= 3 else {
+                return "Libre 2 family 7F (incomplete patchInfo)"
+            }
+            return patchInfo[2] & 0x0F == 0 ? "Libre 2 EU 7F" : "Libre 2 Plus EU 7F"
+        default:
+            return "\(SensorType(patchInfo: patchInfo).description) (0x\(String(format: "%02X", sensorType)))"
+        }
+    }
 }

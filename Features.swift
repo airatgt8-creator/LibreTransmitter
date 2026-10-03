@@ -19,6 +19,11 @@ public final class Features {
     
     static public var allowsEditingFactoryCalibrationData = false
     static public var allowOneMinuteReadings = false
+
+    /// Safety lock for the Libre 2 direct diagnostic build. Direct sensor values remain visible
+    /// but are marked display-only, and LoopWorkspace adds a separate hard stop before automatic
+    /// dosing is enacted. Do not disable either guard before real-sensor validation.
+    static public let directLibreDiagnosticMode = true
     
     // Uses Vibration through apples audio api for glucose alarms. This could be considered an api abuse from apple's standpoint;
     // since apis invoked for this feature are meant for audio streaming apps.

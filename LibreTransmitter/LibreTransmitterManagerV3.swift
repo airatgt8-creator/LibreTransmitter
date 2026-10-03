@@ -159,6 +159,7 @@ open class LibreTransmitterManagerV3: CGMManager, LibreTransmitterDelegate {
             "transmitterbattery: \(String(describing: proxy?.metadata?.batteryString))",
             "SensorData: \(getPersistedSensorDataForDebug())",
             "providesBLEHeartbeat: \(providesBLEHeartbeat)",
+            "directLibreDiagnosticMode: \(Features.directLibreDiagnosticMode)",
             "Metainfo::\n\(AppMetaData.allProperties)",
             ""
         ].joined(separator: "\n")
@@ -499,7 +500,12 @@ extension LibreTransmitterManagerV3 {
         return startDate?.addingTimeInterval(1)
     }
 
-    func glucosesToSamplesFilter(_ array: [LibreGlucose], startDate: Date?, calculateTrends: Bool = true) -> [NewGlucoseSample] {
+    func glucosesToSamplesFilter(
+        _ array: [LibreGlucose],
+        startDate: Date?,
+        calculateTrends: Bool = true,
+        isDisplayOnly: Bool = false
+    ) -> [NewGlucoseSample] {
         let glucoses = array.filter { $0.isStateValid }
         
         let newest = glucoses.first
@@ -525,7 +531,7 @@ extension LibreTransmitterManagerV3 {
                     condition: nil,
                     trend: trend,
                     trendRate: nil,
-                    isDisplayOnly: false,
+                    isDisplayOnly: isDisplayOnly,
                     wasUserEntered: false,
                     syncIdentifier: $0.syncId,
                     device: self.proxy?.device)

@@ -26,6 +26,15 @@ extension LibreTransmitterManagerV3 {
     public func libreSensorDidUpdate(with bleData: Libre2.LibreBLEResponse, and Device: LibreTransmitterMetadata) {
         self.logger.debug("got sensordata: \(String(describing: bleData))")
         let typeDesc = Device.sensorType().debugDescription
+        let uid = Device.uid.map { Data($0).hexEncodedString().uppercased() } ?? "none"
+        let patchInfo = Device.patchInfo?.hexEncodedString().uppercased() ?? "none"
+        let diagnosticType = Device.patchInfo.map { SensorType.diagnosticDescription(patchInfo: $0) } ?? "unknown"
+        let diagnosticMessage = "[LibreRU][CGM] stage=ble-reading" +
+            " uid=\(uid) patchInfo=\(patchInfo) sensorType=\(diagnosticType)" +
+            " age=\(bleData.age) trendCount=\(bleData.trend.count)" +
+            " historyCount=\(bleData.history.count) crcVerified=\(bleData.crcVerified)"
+        self.logger.info("\(diagnosticMessage, privacy: .public)")
+        self.logDeviceCommunication(diagnosticMessage, type: .receive)
 
         let now = Date()
         // only one reading per 1 minute / 5 minutes
@@ -80,7 +89,14 @@ extension LibreTransmitterManagerV3 {
 
         let glucose = LibreGlucose.fromTrendMeasurements(sortedTrends, nativeCalibrationData: calibrationData)
 
-        var newGlucose : [NewGlucoseSample] = glucosesToSamplesFilter(glucose, startDate: getStartDateForFilter())
+        var newGlucose : [NewGlucoseSample] = glucosesToSamplesFilter(
+            glucose,
+            startDate: getStartDateForFilter(),
+            isDisplayOnly: Features.directLibreDiagnosticMode
+        )
+        if Features.directLibreDiagnosticMode {
+            logger.info("[LibreRU][SAFETY] Direct Libre samples are display-only; LoopWorkspace diagnostic builds also block automatic dosing")
+        }
         // For libre2 bluetooth we do need all trend elements to calculate trendarrow,
         // but we can't report all those trends back to loop
         if let newest = newGlucose.first {

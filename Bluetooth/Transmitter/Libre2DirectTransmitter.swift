@@ -74,8 +74,8 @@ class Libre2DirectTransmitter: LibreTransmitterProxyProtocol {
     }
 
     required init(delegate: LibreTransmitterDelegate, advertisementData: [String: Any]?) {
-        // advertisementData is unknown for the miaomiao
         self.delegate = delegate
+        delegate.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=transmitter-created", type: .connection)
     }
 
     func requestData(writeCharacteristics: CBCharacteristic, peripheral: CBPeripheral) {
@@ -85,48 +85,67 @@ class Libre2DirectTransmitter: LibreTransmitterProxyProtocol {
     func updateValueForNotifyCharacteristics(_ value: Data, peripheral: CBPeripheral, writeCharacteristic: CBCharacteristic?) {
         rxBuffer.append(value)
 
-        logger.debug("libre2 direct Appended value with length  \(String(describing: value.count)), buffer length is: \(String(describing: self.rxBuffer.count))")
+        logger.debug("[LibreRU][BLE] stage=notification fragmentBytes=\(value.count) accumulatedBytes=\(self.rxBuffer.count) expectedBytes=\(expectedBufferSize)")
         
         delegate?.libreDeviceLogMessage(payload: "libre2direct received value: \(value.toDebugString())", type: .receive)
 
         if rxBuffer.count == expectedBufferSize {
+            delegate?.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=frame-assembled bytes=\(rxBuffer.count)", type: .receive)
             handleCompleteMessage()
+        } else if rxBuffer.count > expectedBufferSize {
+            logger.error("[LibreRU][BLE] stage=frame-assembled result=oversized bytes=\(self.rxBuffer.count) expectedBytes=\(expectedBufferSize)")
+            delegate?.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=frame-assembled result=oversized bytes=\(rxBuffer.count) expectedBytes=\(expectedBufferSize)", type: .error)
+            reset()
         }
 
     }
 
     func didDiscoverWriteCharacteristics(_ peripheral: CBPeripheral, writeCharacteristics: CBCharacteristic) {
 
+        logger.info("[LibreRU][BLE] stage=write-characteristic-discovered peripheral=\(peripheral.name ?? "unknown", privacy: .public) characteristic=\(writeCharacteristics.uuid.uuidString, privacy: .public)")
+
         guard let unlock = unlock() else {
-            logger.debug("Cannot unlock sensor, aborting")
+            logger.error("[LibreRU][BLE] stage=unlock-payload result=failed")
+            delegate?.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=unlock-payload result=failed", type: .error)
             return
         }
 
-        logger.debug("Writing streaming unlock code to peripheral: \(unlock.hexEncodedString())")
+        logger.info("[LibreRU][BLE] stage=unlock-write bytes=\(unlock.count) payload=\(unlock.hexEncodedString().uppercased(), privacy: .public)")
         
-        delegate?.libreDeviceLogMessage(payload: "Writing streaming unlock code to peripheral: \(unlock.hexEncodedString())", type: .send)
+        delegate?.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=unlock-write bytes=\(unlock.count) payload=\(unlock.hexEncodedString().uppercased())", type: .send)
         peripheral.writeValue(unlock, for: writeCharacteristics, type: .withResponse)
 
     }
 
     func didDiscoverNotificationCharacteristic(_ peripheral: CBPeripheral, notifyCharacteristic: CBCharacteristic) {
 
-        logger.debug("libre2: saving notifyCharacteristic")
-        // peripheral.setNotifyValue(true, for: notifyCharacteristic)
-        logger.debug("libre2 setting notify while discovering : \(String(describing: notifyCharacteristic.debugDescription))")
+        logger.info("[LibreRU][BLE] stage=notify-characteristic-discovered peripheral=\(peripheral.name ?? "unknown", privacy: .public) characteristic=\(notifyCharacteristic.uuid.uuidString, privacy: .public)")
+        delegate?.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=notify-subscribe characteristic=\(notifyCharacteristic.uuid.uuidString)", type: .send)
         peripheral.setNotifyValue(true, for: notifyCharacteristic)
     }
 
     private func unlock() -> Data? {
 
         guard var sensor = UserDefaults.standard.preSelectedSensor else {
-            logger.debug("impossible to unlock sensor")
+            logger.error("[LibreRU][BLE] stage=unlock-payload result=missing-sensor")
+            return nil
+        }
+
+        guard sensor.uuid.count == 8, sensor.patchInfo.count >= 6 else {
+            logger.error("[LibreRU][BLE] stage=unlock-payload result=invalid-identity uidBytes=\(sensor.uuid.count) patchInfoBytes=\(sensor.patchInfo.count)")
             return nil
         }
 
         sensor.unlockCount +=  1
 
         UserDefaults.standard.preSelectedSensor = sensor
+
+        let sensorTypeDescription = SensorType.diagnosticDescription(patchInfo: sensor.patchInfo)
+        let unlockMessage = "[LibreRU][BLE] stage=unlock-payload" +
+            " uid=\(sensor.uuid.hexEncodedString().uppercased())" +
+            " patchInfo=\(sensor.patchInfo.hexEncodedString().uppercased())" +
+            " sensorType=\(sensorTypeDescription) unlockCount=\(sensor.unlockCount)"
+        logger.info("\(unlockMessage, privacy: .public)")
 
         let unlockPayload = Libre2.streamingUnlockPayload(sensorUID: sensor.uuid, info: sensor.patchInfo, enableTime: 42, unlockCount: UInt16(sensor.unlockCount))
         return Data(unlockPayload)
@@ -139,24 +158,37 @@ class Libre2DirectTransmitter: LibreTransmitterProxyProtocol {
     private var lastSensorUUID : [UInt8]?
     func handleCompleteMessage() {
         guard rxBuffer.count >= expectedBufferSize else {
-            logger.debug("libre2 handle complete message with incorrect buffersize")
+            logger.error("[LibreRU][BLE] stage=frame-validation result=short bytes=\(self.rxBuffer.count) expectedBytes=\(expectedBufferSize)")
             reset()
             return
         }
 
         guard let sensor = UserDefaults.standard.preSelectedSensor else {
-            logger.debug("libre2 handle complete message without sensorinfo present")
+            logger.error("[LibreRU][BLE] stage=frame-validation result=missing-sensor")
             reset()
             return
         }
 
         do {
+            let decryptStartMessage = "[LibreRU][BLE] stage=decrypt result=started" +
+                " encryptedBytes=\(self.rxBuffer.count)" +
+                " uid=\(sensor.uuid.hexEncodedString().uppercased())" +
+                " sensorType=\(SensorType.diagnosticDescription(patchInfo: sensor.patchInfo))"
+            logger.info("\(decryptStartMessage, privacy: .public)")
             let decryptedBLE = Data(try Libre2.decryptBLE(id: [UInt8](sensor.uuid), data: [UInt8](rxBuffer)))
             var sensorUpdate = Libre2.parseBLEData(decryptedBLE)
+            let decryptSuccessMessage = "[LibreRU][BLE] stage=decrypt result=success" +
+                " decryptedBytes=\(decryptedBLE.count) age=\(sensorUpdate.age)" +
+                " trendCount=\(sensorUpdate.trend.count) historyCount=\(sensorUpdate.history.count)" +
+                " crcVerified=\(sensorUpdate.crcVerified)"
+            logger.info("\(decryptSuccessMessage, privacy: .public)")
  
 
             guard sensorUpdate.crcVerified else {
+                logger.error("[LibreRU][BLE] stage=crc result=failed")
+                delegate?.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=crc result=failed", type: .error)
                 delegate?.libreSensorDidUpdate(with: .checksumValidationError)
+                reset()
                 return
             }
             
@@ -213,11 +245,11 @@ class Libre2DirectTransmitter: LibreTransmitterProxyProtocol {
             }
 
             delegate?.libreSensorDidUpdate(with: sensorUpdate, and: metadata!)
-
-            print("libre2 got sensorupdate: \(String(describing: sensorUpdate))")
+            delegate?.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=reading-forwarded diagnosticMode=display-only age=\(sensorUpdate.age) trendCount=\(sensorUpdate.trend.count)", type: .receive)
 
         } catch {
-
+            logger.error("[LibreRU][BLE] stage=decrypt result=failed error=\(error.localizedDescription, privacy: .public)")
+            delegate?.libreDeviceLogMessage(payload: "[LibreRU][BLE] stage=decrypt result=failed error=\(error.localizedDescription)", type: .error)
         }
 
         reset()

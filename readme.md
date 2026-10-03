@@ -1,6 +1,8 @@
 # LibreTransmitter for Loop
 This is a https://github.com/loopkit/loop plugin for connecting to libresensors via miaomiao and bubble transmitters
 
+> The `ourloop-ru` branch is diagnostic-only. Libre 2 direct values are marked display-only, detailed `[LibreRU]` NFC/BLE traces are enabled, and the matching `LoopWorkspace/ourloop-ru` branch must be used so automatic dosing is hard-disabled.
+
 # Supported sensors
 * US Libre 1 10 day sensors (tested)
 * US Libre 1 14 day sensors (untested)

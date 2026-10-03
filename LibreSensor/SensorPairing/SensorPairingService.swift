@@ -8,6 +8,7 @@
 import Foundation
 import Combine
 import CoreNFC
+import OSLog
 
 public enum PairingError: Error {
     case noTagInfo
@@ -53,6 +54,7 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
 
     private let nfcQueue = DispatchQueue(label: "libre-direct.nfc-queue")
     private let accessQueue = DispatchQueue(label: "libre-direct.nfc-access-queue")
+    private let logger = Logger(forType: SensorPairingService.self)
 
     private let unlockCode: UInt32 = 42 // 42
 
@@ -60,9 +62,10 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
 
     public func pairSensor() throws {
         if !Features.phoneNFCAvailable {
+            logger.error("[LibreRU][NFC] stage=availability result=unavailable")
             throw PairingError.nfcNotSupported
         }
-        print("Asked to pair sensor! phoneNFCAvailable: \(Features.phoneNFCAvailable)")
+        logger.info("[LibreRU][NFC] stage=session-requested phoneNFCAvailable=\(Features.phoneNFCAvailable)")
 
         if NFCTagReaderSession.readingAvailable {
             accessQueue.async {
@@ -94,9 +97,11 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
     }
 
     public func tagReaderSessionDidBecomeActive(_ session: NFCTagReaderSession) {
+        logger.info("[LibreRU][NFC] stage=session-active")
     }
 
     public func tagReaderSession(_ session: NFCTagReaderSession, didInvalidateWithError error: Error) {
+        logger.info("[LibreRU][NFC] stage=session-invalidated error=\(error.localizedDescription, privacy: .public)")
         if let error = error as? NFCReaderError, error.code != .readerSessionInvalidationErrorUserCanceled {
             session.invalidate(errorMessage: "Connection failure: \(error.localizedDescription)")
             self.sendError(error)
@@ -106,115 +111,204 @@ public class SensorPairingService: NSObject, NFCTagReaderSessionDelegate, Sensor
     }
 
     public func tagReaderSession(_ session: NFCTagReaderSession, didDetect tags: [NFCTag]) {
-        guard let firstTag = tags.first else { return }
-        guard case .iso15693(let tag) = firstTag else { return }
-
-        let blocks = 43
-        let requestBlocks = 3
-
-        let requests = Int(ceil(Double(blocks) / Double(requestBlocks)))
-        let remainder = blocks % requestBlocks
-        var dataArray = [Data](repeating: Data(), count: blocks)
+        logger.info("[LibreRU][NFC] stage=tag-detected count=\(tags.count)")
+        guard let firstTag = tags.first else {
+            logger.error("[LibreRU][NFC] stage=tag-detected result=no-tags")
+            return
+        }
+        guard case .iso15693(let tag) = firstTag else {
+            logger.error("[LibreRU][NFC] stage=tag-detected result=unsupported-tag")
+            return
+        }
 
         session.connect(to: firstTag) { error in
-            if error != nil {
+            if let error {
+                self.logger.error("[LibreRU][NFC] stage=connect result=failed error=\(error.localizedDescription, privacy: .public)")
+                session.invalidate(errorMessage: PairingError.noTagInfo.localizedDescription)
+                self.sendError(PairingError.noTagInfo)
                 return
             }
 
+            self.logger.info("[LibreRU][NFC] stage=connect result=success")
+
             tag.getSystemInfo(requestFlags: [.address, .highDataRate]) { result in
                 switch result {
-                case .failure:
+                case .failure(let error):
+                    self.logger.error("[LibreRU][NFC] stage=system-info result=failed error=\(error.localizedDescription, privacy: .public)")
                     session.invalidate(errorMessage: PairingError.noTagInfo.localizedDescription)
                     self.sendError(PairingError.noTagInfo)
                     return
                 case .success:
+                    self.logger.info("[LibreRU][NFC] stage=system-info result=success")
                     tag.customCommand(requestFlags: .highDataRate, customCommandCode: 0xA1, customRequestParameters: Data()) { response, error in
+                        if let error {
+                            self.logger.error("[LibreRU][NFC] stage=patch-info result=failed error=\(error.localizedDescription, privacy: .public)")
+                            session.invalidate(errorMessage: PairingError.noPatchInfo.localizedDescription)
+                            self.sendError(PairingError.noPatchInfo)
+                            return
+                        }
 
-                        for i in 0 ..< requests {
-                            tag.readMultipleBlocks(
-                                requestFlags: [.highDataRate, .address],
-                                // swiftlint:disable:next line_length
-                                blockRange: NSRange(UInt8(i * requestBlocks) ... UInt8(i * requestBlocks + (i == requests - 1 ? (remainder == 0 ? requestBlocks : remainder) : requestBlocks) - (requestBlocks > 1 ? 1 : 0)))
-                                
-                            ) { blockArray, error in
-                                if error != nil {
-                                    if i != requests - 1 { return }
-                                } else {
-                                    for j in 0 ..< blockArray.count {
-                                        dataArray[i * requestBlocks + j] = blockArray[j]
-                                    }
-                                }
+                        let sensorUID = Data(tag.identifier.reversed())
+                        let patchInfo = response
+                        let patchHex = patchInfo.hexEncodedString().uppercased()
+                        let uidHex = sensorUID.hexEncodedString().uppercased()
+                        let sensorTypeDescription = SensorType.diagnosticDescription(patchInfo: patchInfo)
 
-                                if i == requests - 1 {
-                                    var fram = Data()
+                        let identityMessage = "[LibreRU][NFC] stage=patch-info result=success" +
+                            " uid=\(uidHex) uidBytes=\(sensorUID.count)" +
+                            " patchInfo=\(patchHex) patchInfoBytes=\(patchInfo.count)" +
+                            " sensorType=\(sensorTypeDescription)"
+                        self.logger.info("\(identityMessage, privacy: .public)")
 
-                                    for (_, data) in dataArray.enumerated() {
-                                        if data.count > 0 {
-                                            fram.append(data)
-                                        }
-                                    }
+                        // The crypto helpers index bytes 4 and 5. Reject short responses before
+                        // constructing either the NFC enable command or the later BLE unlock.
+                        guard sensorUID.count == 8, patchInfo.count >= 6 else {
+                            self.logger.error("[LibreRU][NFC] stage=identity-validation result=failed uidBytes=\(sensorUID.count) patchInfoBytes=\(patchInfo.count)")
+                            session.invalidate(errorMessage: PairingError.noPatchInfo.localizedDescription)
+                            self.sendError(PairingError.noPatchInfo)
+                            return
+                        }
 
-                                    // get sensorUID and patchInfo and send to delegate
-                                    let sensorUID = Data(tag.identifier.reversed())
-                                    let patchInfo = response
-
-                                    // patchInfo should have length 6, which sometimes is not the case, as there are occuring crashes in nfcCommand and Libre2BLEUtilities.streamingUnlockPayload
-                                    guard patchInfo.count >= 6 else {
-                                        session.invalidate(errorMessage: PairingError.noPatchInfo.localizedDescription)
-                                        return
-                                    }
-
-                                    let subCmd: Subcommand = .enableStreaming
-                                    let cmd = self.nfcCommand(subCmd, unlockCode: self.unlockCode, patchInfo: patchInfo, sensorUID: sensorUID)
-
-                                    tag.customCommand(requestFlags: .highDataRate, customCommandCode: Int(cmd.code), customRequestParameters: cmd.parameters) { response, _ in
-                                        var streamingEnabled = false
-                                        var macAddress : String?
-
-                                        if subCmd == .enableStreaming && response.count == 6 {
-                                            streamingEnabled = true
-                                            macAddress = Data(response.reversed()).hexEncodedString().uppercased()
-                                        }
-
-                                        
-
-                                        let patchHex = patchInfo.hexEncodedString()
-                                        let sensorType = SensorType(patchInfo: patchInfo)
-
-                                        print("got patchhex: \(patchHex) and sensorType: \(sensorType), with mac address: \(macAddress)")
-
-                                        guard sensorUID.count == 8 && patchInfo.count == 6 && fram.count == 344 else {
-                                            // self.readingsSubject.send(completion: .failure(LibreError.noSensorData))
-                                            session.invalidate(errorMessage: PairingError.noSensorData.localizedDescription)
-                                            self.sendError(PairingError.noSensorData)
-                                            return
-                                        }
-                                        
-                                        guard sensorType == .libre2  else {
-                                            session.invalidate(errorMessage: PairingError.wrongSensorType.localizedDescription)
-                                            self.sendError(PairingError.noSensorData)
-                                            return
-                                        }
-                                        
-                                        
-
-                                        do {
-                                            let decryptedBytes = try Libre2.decryptFRAM(type: sensorType, id: [UInt8](sensorUID), info: patchInfo, data: [UInt8](fram))
-
-                                            self.sendUpdate(SensorPairingInfo(uuid: sensorUID, patchInfo: patchInfo, fram: Data(decryptedBytes), streamingEnabled: streamingEnabled, macAddress: macAddress))
-                                            session.invalidate()
-                                            return
-                                        } catch {
-                                            print("problem decrypting")
-                                            session.invalidate(errorMessage: PairingError.decryptionError.localizedDescription)
-                                            self.sendError(PairingError.decryptionError)
-                                        }
-                                    }
-                                }
+                        // Core NFC operations must be serialized. The previous implementation
+                        // launched all 15 reads at once and assembled FRAM when the final request
+                        // happened to return, which could produce an incomplete frame.
+                        self.readFRAMSequentially(tag: tag) { result in
+                            switch result {
+                            case .failure(let error):
+                                self.logger.error("[LibreRU][NFC] stage=fram-read result=failed error=\(error.localizedDescription, privacy: .public)")
+                                session.invalidate(errorMessage: PairingError.noSensorData.localizedDescription)
+                                self.sendError(PairingError.noSensorData)
+                            case .success(let fram):
+                                self.logger.info("[LibreRU][NFC] stage=fram-read result=success bytes=\(fram.count)")
+                                self.enableStreamingAndFinish(
+                                    tag: tag,
+                                    session: session,
+                                    sensorUID: sensorUID,
+                                    patchInfo: patchInfo,
+                                    fram: fram
+                                )
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private func readFRAMSequentially(
+        tag: NFCISO15693Tag,
+        nextBlock: Int = 0,
+        blockCount: Int = 43,
+        requestBlockCount: Int = 3,
+        buffer: Data = Data(),
+        completion: @escaping (Result<Data, Error>) -> Void
+    ) {
+        guard nextBlock < blockCount else {
+            completion(.success(buffer))
+            return
+        }
+
+        let lastBlock = min(nextBlock + requestBlockCount - 1, blockCount - 1)
+        logger.debug("[LibreRU][NFC] stage=fram-read requestBlocks=\(nextBlock)-\(lastBlock) accumulatedBytes=\(buffer.count)")
+
+        tag.readMultipleBlocks(
+            requestFlags: [.highDataRate, .address],
+            blockRange: NSRange(UInt8(nextBlock) ... UInt8(lastBlock))
+        ) { blockArray, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+
+            let expectedBlocks = lastBlock - nextBlock + 1
+            guard blockArray.count == expectedBlocks else {
+                completion(.failure(PairingStageError.unexpectedBlockCount(expected: expectedBlocks, actual: blockArray.count)))
+                return
+            }
+
+            var nextBuffer = buffer
+            blockArray.forEach { nextBuffer.append($0) }
+            self.readFRAMSequentially(
+                tag: tag,
+                nextBlock: lastBlock + 1,
+                blockCount: blockCount,
+                requestBlockCount: requestBlockCount,
+                buffer: nextBuffer,
+                completion: completion
+            )
+        }
+    }
+
+    private func enableStreamingAndFinish(
+        tag: NFCISO15693Tag,
+        session: NFCTagReaderSession,
+        sensorUID: Data,
+        patchInfo: Data,
+        fram: Data
+    ) {
+        let sensorType = SensorType(patchInfo: patchInfo)
+        let sensorTypeDescription = SensorType.diagnosticDescription(patchInfo: patchInfo)
+
+        guard sensorUID.count == 8, patchInfo.count >= 6, fram.count == 344 else {
+            logger.error("[LibreRU][NFC] stage=payload-validation result=failed uidBytes=\(sensorUID.count) patchInfoBytes=\(patchInfo.count) framBytes=\(fram.count)")
+            session.invalidate(errorMessage: PairingError.noSensorData.localizedDescription)
+            sendError(PairingError.noSensorData)
+            return
+        }
+
+        guard sensorType == .libre2 else {
+            logger.error("[LibreRU][NFC] stage=sensor-type-validation result=unsupported sensorType=\(sensorTypeDescription, privacy: .public)")
+            session.invalidate(errorMessage: PairingError.wrongSensorType.localizedDescription)
+            sendError(PairingError.wrongSensorType)
+            return
+        }
+
+        let subCommand: Subcommand = .enableStreaming
+        let command = nfcCommand(subCommand, unlockCode: unlockCode, patchInfo: patchInfo, sensorUID: sensorUID)
+        logger.info("[LibreRU][NFC] stage=enable-streaming requestCode=0x\(String(format: "%02X", command.code), privacy: .public) parameters=\(command.parameters.hexEncodedString().uppercased(), privacy: .public)")
+
+        tag.customCommand(
+            requestFlags: .highDataRate,
+            customCommandCode: Int(command.code),
+            customRequestParameters: command.parameters
+        ) { response, error in
+            if let error {
+                self.logger.error("[LibreRU][NFC] stage=enable-streaming result=failed responseBytes=\(response.count) error=\(error.localizedDescription, privacy: .public)")
+            } else {
+                self.logger.info("[LibreRU][NFC] stage=enable-streaming result=response responseBytes=\(response.count) response=\(response.hexEncodedString().uppercased(), privacy: .public)")
+            }
+
+            let streamingEnabled = error == nil && response.count == 6
+            let macAddress = streamingEnabled ? Data(response.reversed()).hexEncodedString().uppercased() : nil
+
+            guard streamingEnabled else {
+                self.logger.error("[LibreRU][NFC] stage=enable-streaming result=invalid-response expectedBytes=6 actualBytes=\(response.count)")
+                session.invalidate(errorMessage: PairingError.noSensorData.localizedDescription)
+                self.sendError(PairingError.noSensorData)
+                return
+            }
+
+            do {
+                self.logger.info("[LibreRU][NFC] stage=fram-decrypt result=started sensorType=\(sensorTypeDescription, privacy: .public)")
+                let decryptedBytes = try Libre2.decryptFRAM(
+                    type: sensorType,
+                    id: [UInt8](sensorUID),
+                    info: patchInfo,
+                    data: [UInt8](fram)
+                )
+                self.logger.info("[LibreRU][NFC] stage=fram-decrypt result=success decryptedBytes=\(decryptedBytes.count) macAddress=\(macAddress ?? "none", privacy: .public)")
+                self.sendUpdate(SensorPairingInfo(
+                    uuid: sensorUID,
+                    patchInfo: patchInfo,
+                    fram: Data(decryptedBytes),
+                    streamingEnabled: true,
+                    macAddress: macAddress
+                ))
+                session.invalidate()
+            } catch {
+                self.logger.error("[LibreRU][NFC] stage=fram-decrypt result=failed error=\(error.localizedDescription, privacy: .public)")
+                session.invalidate(errorMessage: PairingError.decryptionError.localizedDescription)
+                self.sendError(PairingError.decryptionError)
             }
         }
     }
@@ -376,6 +470,17 @@ extension UInt16 {
 private struct NFCCommand {
     let code: UInt8
     let parameters: Data
+}
+
+private enum PairingStageError: LocalizedError {
+    case unexpectedBlockCount(expected: Int, actual: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .unexpectedBlockCount(let expected, let actual):
+            return "Expected \(expected) NFC blocks but received \(actual)"
+        }
+    }
 }
 
 private enum Subcommand: UInt8, CustomStringConvertible {
